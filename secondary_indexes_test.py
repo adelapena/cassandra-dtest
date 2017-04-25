@@ -8,6 +8,7 @@ import logging
 
 from flaky import flaky
 
+from cassandra import ConsistencyLevel as CL
 from cassandra import InvalidRequest
 from cassandra.concurrent import (execute_concurrent,
                                   execute_concurrent_with_args)
@@ -15,8 +16,13 @@ from cassandra.protocol import ConfigurationException
 from cassandra.query import BatchStatement, SimpleStatement
 
 from dtest import Tester, create_ks, create_cf
-from tools.assertions import assert_bootstrap_state, assert_invalid, assert_none, assert_one, assert_row_count
-from tools.data import block_until_index_is_built, rows_to_list
+from tools.assertions import assert_all, assert_bootstrap_state, assert_invalid, assert_none, assert_one, assert_row_count
+from tools.data import block_until_index_is_built, index_is_built, rows_to_list
+# from dtest import (DISABLE_VNODES, OFFHEAP_MEMTABLES, DtestTimeoutError,
+#                    Tester, debug, CASSANDRA_VERSION_FROM_BUILD, create_ks, create_cf)
+# from tools.assertions import assert_all, assert_bootstrap_state, assert_invalid, assert_none, assert_one, assert_row_count
+# from tools.data import index_is_built, rows_to_list
+# from tools.decorators import since
 from tools.misc import new_node
 
 since = pytest.mark.since
@@ -1239,3 +1245,379 @@ class TestPreJoinCallback(Tester):
             assert node2.grep_log('Executing pre-join post-bootstrap tasks')
 
         self._base_test(write_survey_and_join)
+
+
+@since('4.0')
+class TestSecondaryIndexesWithStaleNodes(Tester):
+    """
+    @jira_ticket CASSANDRA-8272
+
+    Test the consistency of secondary indexes searches when the coordinator receives
+    no results from up to date replicas and stale results from a stale replica.
+    """
+
+    def _prepare_cluster(self, high_latency_in_index_update=False, disable_hinted_handoff=False):
+        """
+        :param high_latency_in_index_update if the cluster should have a long delay for 2i updates in one of its nodes
+        :param disable_hinted_handoff if hinted handoff should be disable
+        :return: a session connected exclusively to the first node
+        """
+        cluster = self.cluster
+
+        # Disable hinted handoff and set batch commit log so this doesn't interfere with the test
+        if disable_hinted_handoff:
+            cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
+            cluster.set_batch_commitlog(enabled=True)
+
+        cluster.populate(2, install_byteman=True).start()
+        node1 = cluster.nodelist()[0]
+
+        # simulate high latency index update in one node
+        if high_latency_in_index_update:
+            node1.byteman_submit(['./byteman/4.0/index_update_sleep.btm'])
+
+        session = self.patient_exclusive_cql_connection(node1, consistency_level=CL.ALL)
+        create_ks(session, 'ks', 2)
+        session.execute("USE ks")
+
+        return session
+
+    def test_update_on_skinny_table(self):
+        session = self._prepare_cluster(high_latency_in_index_update=True)
+
+        session.execute("CREATE TABLE t (k int PRIMARY KEY, v text)")
+        session.execute("CREATE INDEX ON t(v)")
+        session.execute("INSERT INTO t(k, v) VALUES (0, 'old')")
+
+        session.execute(SimpleStatement("UPDATE t SET v = 'new' WHERE k = 0", consistency_level=CL.ONE))
+        assert_none(session, "SELECT * FROM t WHERE v = 'old'")
+        assert_one(session, "SELECT * FROM t WHERE v = 'new'", [0, 'new'])
+
+    def test_update_on_wide_table(self):
+        session = self._prepare_cluster(high_latency_in_index_update=True)
+
+        session.execute("CREATE TABLE t (k int, c int, v text, s int STATIC, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(v)")
+        session.execute("INSERT INTO t(k, s) VALUES (0, 9)")
+        session.execute("INSERT INTO t(k, c, v) VALUES (0, -1, 'old')")
+        session.execute("INSERT INTO t(k, c, v) VALUES (0, 0, 'old')")
+        session.execute("INSERT INTO t(k, c, v) VALUES (0, 1, 'old')")
+
+        session.execute(SimpleStatement("UPDATE t SET v = 'new' WHERE k = 0 AND c = 0", consistency_level=CL.ONE))
+        assert_all(session, "SELECT * FROM t WHERE v = 'old'", [[0, -1, 9, 'old'], [0, 1, 9, 'old']])
+        assert_all(session, "SELECT * FROM t WHERE v = 'new'", [[0, 0, 9, 'new']])
+
+    def test_update_on_static_column(self):
+        session = self._prepare_cluster(high_latency_in_index_update=True)
+
+        session.execute("CREATE TABLE t (k int, c int, v int, s text STATIC, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(s)")
+        session.execute("INSERT INTO t(k, s) VALUES (0, 'old')")
+        session.execute("INSERT INTO t(k, c, v) VALUES (0, 1, 10)")
+        session.execute("INSERT INTO t(k, c, v) VALUES (0, 2, 20)")
+
+        session.execute(SimpleStatement("UPDATE t SET s = 'new' WHERE k = 0", consistency_level=CL.ONE))
+        assert_none(session, "SELECT * FROM t WHERE s = 'old'")
+        assert_all(session, "SELECT * FROM t WHERE s = 'new'", [[0, 1, 'new', 10], [0, 2, 'new', 20]])
+
+    def test_update_on_collection(self):
+        session = self._prepare_cluster(high_latency_in_index_update=True)
+
+        session.execute("CREATE TABLE t (k int PRIMARY KEY, v set<int>)")
+        session.execute("CREATE INDEX ON t(v)")
+        session.execute("INSERT INTO t(k, v) VALUES (0, {-1, 0, 1})")
+
+        session.execute(SimpleStatement("UPDATE t SET v = v - {0} WHERE k = 0", consistency_level=CL.ONE))
+        assert_none(session, "SELECT * FROM t WHERE v CONTAINS 0")
+        assert_one(session, "SELECT * FROM t WHERE v CONTAINS 1", [0, [-1, 1]])
+
+    def test_complementary_deletion_with_limit_on_partition_key_column(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k1 int, k2 int, c int, s int STATIC, PRIMARY KEY((k1, k2), c))")
+        session.execute("CREATE INDEX ON t(k1)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k1, k2, s) VALUES (0, 1, 10)")
+        session.execute("INSERT INTO t (k1, k2, s) VALUES (0, 2, 20)")
+        # assert_all(session, "SELECT * FROM t WHERE k1 = 0", [[0, 1, 8], [0, 2, 8]], ignore_order=True)
+
+        # we delete 1: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k1 = 0 AND k2 = 1")
+        node2.start(wait_other_notice=True)
+
+        # we delete 2: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k1 = 0 AND k2 = 2")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_none(session, "SELECT * FROM t WHERE k1 = 0 LIMIT 1")
+
+    def test_complementary_deletion_with_limit_on_clustering_key_column(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k int, c int, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(c)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k, c) VALUES (1, 0)")
+        session.execute("INSERT INTO t (k, c) VALUES (2, 0)")
+        assert_all(session, "SELECT * FROM t WHERE c = 0", [[1, 0], [2, 0]])
+
+        # we delete 1: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k = 1")
+        node2.start(wait_other_notice=True)
+
+        # we delete 2: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k = 2")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_none(session, "SELECT * FROM t WHERE c = 0 LIMIT 1")
+
+    def test_complementary_deletion_with_limit_on_static_column(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k int, c int, s int STATIC, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(s)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k, s) VALUES (1, 0)")
+        session.execute("INSERT INTO t (k, c, s) VALUES (2, 20, 0)")
+        assert_all(session, "SELECT * FROM t WHERE s = 0", [[1, None, 0], [2, 20, 0]])
+
+        # we delete 1: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k = 1")
+        node2.start(wait_other_notice=True)
+
+        # we delete 2: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k = 2")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_none(session, "SELECT * FROM t WHERE s = 0 LIMIT 1")
+        assert_none(session, "SELECT * FROM t WHERE s = 1 LIMIT 1")
+
+    def test_complementary_deletion_with_limit_on_regular_column(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k int, c int, v int, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(v)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 1, 0)")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 2, 0)")
+        assert_all(session, "SELECT * FROM t WHERE v = 0", [[0, 1, 0], [0, 2, 0]])
+
+        # we delete 1: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k = 0 AND c = 1")
+        node2.start(wait_other_notice=True)
+
+        # we delete 2: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k = 0 AND c = 2")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_none(session, "SELECT * FROM t WHERE v = 0 LIMIT 1")
+
+    def test_complementary_deletion_with_limit_and_rows_after(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k int, c int, v int, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(v)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 1, 0)")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 2, 0)")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 3, 0)")
+        assert_all(session, "SELECT * FROM t WHERE v = 0", [[0, 1, 0], [0, 2, 0], [0, 3, 0]])
+
+        # we delete 1 and insert 4: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k = 0 AND c = 1")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 4, 0)")
+        node2.start(wait_other_notice=True)
+
+        # we delete 2 and insert 5: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 5, 0)")
+        session.execute("DELETE FROM t WHERE k = 0 AND c = 2")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_one(session, "SELECT * FROM t WHERE v = 0 LIMIT 1", [0, 3, 0])
+        assert_all(session, "SELECT * FROM t WHERE v = 0 LIMIT 2", [[0, 3, 0], [0, 4, 0]])
+        assert_all(session, "SELECT * FROM t WHERE v = 0 LIMIT 3", [[0, 3, 0], [0, 4, 0], [0, 5, 0]])
+        assert_all(session, "SELECT * FROM t WHERE v = 0 LIMIT 4", [[0, 3, 0], [0, 4, 0], [0, 5, 0]])
+
+    def test_complementary_deletion_with_limit_and_rows_between(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k int, c int, v int, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(v)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 1, 0)")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 4, 0)")
+        assert_all(session, "SELECT * FROM t WHERE v = 0", [[0, 1, 0], [0, 4, 0]])
+
+        # we delete 1: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("DELETE FROM t WHERE k = 0 AND c = 1")
+        node2.start(wait_other_notice=True)
+
+        # we insert 2 and 3, and we delete 4: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 2, 0)")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 3, 0)")
+        session.execute("DELETE FROM t WHERE k = 0 AND c = 4")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_one(session, "SELECT * FROM t WHERE v = 0 LIMIT 1", [0, 2, 0])
+        assert_all(session, "SELECT * FROM t WHERE v = 0 LIMIT 2", [[0, 2, 0], [0, 3, 0]])
+        assert_all(session, "SELECT * FROM t WHERE v = 0 LIMIT 3", [[0, 2, 0], [0, 3, 0]])
+
+    def test_complementary_update_with_limit_on_static_column(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k int, c int, s text STATIC, v int, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(s)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k, c, v, s) VALUES (1, 10, 100, 'old')")
+        session.execute("INSERT INTO t (k, c, v, s) VALUES (2, 20, 200, 'old')")
+        assert_all(session, "SELECT k, c, v, s FROM t WHERE s = 'old'", [[1, 10, 100, 'old'], [2, 20, 200, 'old']])
+
+        # we update 1: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("UPDATE t SET s = 'new' WHERE k = 1")
+        node2.start(wait_other_notice=True)
+
+        # we update 2: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("UPDATE t SET s = 'new' WHERE k = 2")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_none(session, "SELECT * FROM t WHERE s = 'old' LIMIT 1")
+        assert_one(session, "SELECT k, c, v, s FROM t WHERE s = 'new' LIMIT 1", [1, 10, 100, 'new'])
+        assert_all(session, "SELECT k, c, v, s FROM t WHERE s = 'new'", [[1, 10, 100, 'new'], [2, 20, 200, 'new']])
+
+    def test_complementary_update_with_limit_on_regular_column(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k int, c int, v int, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(v)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 1, 0)")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 2, 0)")
+        assert_all(session, "SELECT * FROM t WHERE v = 0", [[0, 1, 0], [0, 2, 0]])
+
+        # we update 1: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("UPDATE t SET v = 8 WHERE k = 0 AND c = 1")
+        node2.start(wait_other_notice=True)
+
+        # we update 2: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("UPDATE t SET v = 8 WHERE k = 0 AND c = 2")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_none(session, "SELECT * FROM t WHERE v = 0 LIMIT 1")
+        assert_one(session, "SELECT * FROM t WHERE v = 8 LIMIT 1", [0, 1, 8])
+        assert_all(session, "SELECT * FROM t WHERE v = 8", [[0, 1, 8], [0, 2, 8]])
+
+    def test_complementary_update_with_limit_and_rows_between(self):
+        session = self._prepare_cluster(disable_hinted_handoff=True)
+        node1, node2 = self.cluster.nodelist()
+
+        session.execute("CREATE TABLE t (k int, c int, v text, PRIMARY KEY(k, c))")
+        session.execute("CREATE INDEX ON t(v)")
+
+        # we write 1 and 2 in a partition: all nodes get it.
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 1, 'old')")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 4, 'old')")
+        assert_all(session, "SELECT * FROM t WHERE v = 'old'", [[0, 1, 'old'], [0, 4, 'old']])
+
+        # we update 1: only node 1 gets it.
+        node2.flush()
+        node2.stop()
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ONE)
+        session.execute("UPDATE t SET v = 'new' WHERE k = 0 AND c = 1")
+        node2.start(wait_other_notice=True)
+
+        # we insert 2 and 3, and we update 4: only node 2 gets it.
+        node1.flush()
+        node1.stop()
+        session = self.patient_cql_connection(node2, 'ks', consistency_level=CL.ONE)
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 2, 'old')")
+        session.execute("INSERT INTO t (k, c, v) VALUES (0, 3, 'old')")
+        session.execute("UPDATE t SET v = 'new' WHERE k = 0 AND c = 4")
+        node1.start(wait_other_notice=True)
+
+        # read from both nodes
+        session = self.patient_cql_connection(node1, 'ks', consistency_level=CL.ALL)
+        assert_one(session, "SELECT * FROM t WHERE v = 'old' LIMIT 1", [0, 2, 'old'])
+        assert_all(session, "SELECT * FROM t WHERE v = 'old' LIMIT 2", [[0, 2, 'old'], [0, 3, 'old']])
+        assert_all(session, "SELECT * FROM t WHERE v = 'old' LIMIT 3", [[0, 2, 'old'], [0, 3, 'old']])
+        assert_one(session, "SELECT * FROM t WHERE v = 'new' LIMIT 1", [0, 1, 'new'])
+        assert_all(session, "SELECT * FROM t WHERE v = 'new'", [[0, 1, 'new'], [0, 4, 'new']])
