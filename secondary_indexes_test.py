@@ -345,6 +345,8 @@ class TestSecondaryIndexes(Tester):
         # Verify that the index is marked as built and it can answer queries
         assert_one(session, """SELECT table_name, index_name FROM system."IndexInfo" WHERE table_name='k'""", ['k', 'idx'])
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
+        assert 1 == len(node.grep_log('became queryable'))
+        assert 1 == len(node.grep_log('registered and writable'))
 
         # Simulate a failing index rebuild
         before_files = self._index_sstables_files(node, 'k', 't', 'idx')
@@ -357,7 +359,8 @@ class TestSecondaryIndexes(Tester):
         assert before_files == after_files
         assert_none(session, """SELECT * FROM system."IndexInfo" WHERE table_name='k'""")
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
-
+        assert 1 == len(node.grep_log('became not-writable'))
+        
         # Restart the node to trigger the scheduled index rebuild
         before_files = after_files
         node.nodetool('drain')
@@ -371,6 +374,8 @@ class TestSecondaryIndexes(Tester):
         assert before_files != after_files
         assert_one(session, """SELECT table_name, index_name FROM system."IndexInfo" WHERE table_name='k'""", ['k', 'idx'])
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
+        assert 2 == len(node.grep_log('became queryable'))
+        assert 2 == len(node.grep_log('registered and writable'))
 
         # Simulate another failing index rebuild
         before_files = self._index_sstables_files(node, 'k', 't', 'idx')
@@ -383,6 +388,7 @@ class TestSecondaryIndexes(Tester):
         assert before_files == after_files
         assert_none(session, """SELECT * FROM system."IndexInfo" WHERE table_name='k'""")
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
+        assert 2 == len(node.grep_log('became not-writable'))
 
         # Successfully rebuild the index
         before_files = after_files
@@ -394,6 +400,7 @@ class TestSecondaryIndexes(Tester):
         assert before_files != after_files
         assert_one(session, """SELECT table_name, index_name FROM system."IndexInfo" WHERE table_name='k'""", ['k', 'idx'])
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
+        assert 1 == len(node.grep_log('became writable'))
 
     @since('4.0')
     def test_drop_index_while_building(self):
