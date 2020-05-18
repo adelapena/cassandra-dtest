@@ -15,7 +15,8 @@ from cassandra.protocol import ConfigurationException
 from cassandra.query import BatchStatement, SimpleStatement
 
 from dtest import Tester, create_ks, create_cf
-from tools.assertions import assert_bootstrap_state, assert_invalid, assert_none, assert_one, assert_row_count
+from tools.assertions import assert_bootstrap_state, assert_invalid, assert_none, assert_one, assert_row_count, \
+    assert_length_equal, assert_all
 from tools.data import block_until_index_is_built, rows_to_list
 from tools.misc import new_node
 
@@ -345,8 +346,8 @@ class TestSecondaryIndexes(Tester):
         # Verify that the index is marked as built and it can answer queries
         assert_one(session, """SELECT table_name, index_name FROM system."IndexInfo" WHERE table_name='k'""", ['k', 'idx'])
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
-        assert 1 == len(node.grep_log('became queryable'))
-        assert 1 == len(node.grep_log('registered and writable'))
+        assert_length_equal(node.grep_log('became queryable after successful build'), 1)
+        assert_length_equal(node.grep_log('registered and writable'), 1)
 
         # Simulate a failing index rebuild
         before_files = self._index_sstables_files(node, 'k', 't', 'idx')
@@ -356,15 +357,14 @@ class TestSecondaryIndexes(Tester):
         after_files = self._index_sstables_files(node, 'k', 't', 'idx')
 
         # Verify that the index is not rebuilt, not marked as built, and it still can answer queries
-        assert before_files == after_files
         assert_none(session, """SELECT * FROM system."IndexInfo" WHERE table_name='k'""")
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
-        assert 1 == len(node.grep_log('became not-writable'))
-        
+
         # Restart the node to trigger the scheduled index rebuild
         before_files = after_files
         node.nodetool('drain')
         node.stop()
+        mark = node.mark_log()
         cluster.start()
         session = self.patient_cql_connection(node)
         session.execute("USE k")
@@ -374,8 +374,9 @@ class TestSecondaryIndexes(Tester):
         assert before_files != after_files
         assert_one(session, """SELECT table_name, index_name FROM system."IndexInfo" WHERE table_name='k'""", ['k', 'idx'])
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
-        assert 2 == len(node.grep_log('became queryable'))
-        assert 2 == len(node.grep_log('registered and writable'))
+        assert_length_equal(node.grep_log('became queryable after successful build', from_mark=mark), 1)
+        assert_length_equal(node.grep_log('registered and writable', from_mark=mark), 1)
+        mark = node.mark_log()
 
         # Simulate another failing index rebuild
         before_files = self._index_sstables_files(node, 'k', 't', 'idx')
@@ -384,11 +385,15 @@ class TestSecondaryIndexes(Tester):
             node.nodetool("rebuild_index k t idx")
         after_files = self._index_sstables_files(node, 'k', 't', 'idx')
 
+        # Insert a row, the failed index won't index it
+        session.execute("INSERT INTO k.t(k, v) VALUES (4, 1)")
+        assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
+        # session.execute("DELETE FROM k.t WHERE k=4")
+
         # Verify that the index is not rebuilt, not marked as built, and it still can answer queries
         assert before_files == after_files
         assert_none(session, """SELECT * FROM system."IndexInfo" WHERE table_name='k'""")
         assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
-        assert 2 == len(node.grep_log('became not-writable'))
 
         # Successfully rebuild the index
         before_files = after_files
@@ -399,8 +404,8 @@ class TestSecondaryIndexes(Tester):
         # Verify that the index is rebuilt, marked as built, and it can answer queries
         assert before_files != after_files
         assert_one(session, """SELECT table_name, index_name FROM system."IndexInfo" WHERE table_name='k'""", ['k', 'idx'])
-        assert_one(session, "SELECT * FROM k.t WHERE v = 1", [0, 1])
-        assert 1 == len(node.grep_log('became writable'))
+        assert_all(session, "SELECT * FROM k.t WHERE v = 1", [[0, 1], [4, 1]])
+        assert 1 == len(node.grep_log('became writable starting recovery'))
 
     @since('4.0')
     def test_drop_index_while_building(self):
