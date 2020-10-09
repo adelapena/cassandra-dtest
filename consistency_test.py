@@ -18,6 +18,7 @@ from tools.data import (create_c1c2_table, insert_c1c2, insert_columns,
 from tools.jmxutils import JolokiaAgent, make_mbean
 
 since = pytest.mark.since
+ported_to_in_jvm = pytest.mark.ported_to_in_jvm
 logger = logging.getLogger(__name__)
 
 ExpectedConsistency = namedtuple('ExpectedConsistency', ('num_write_nodes', 'num_read_nodes', 'is_strong'))
@@ -1505,6 +1506,7 @@ class TestConsistency(Tester):
         node3.stop(wait_other_notice=True)
         assert_none(session, "SELECT * FROM t WHERE id = 0 LIMIT 1", cl=ConsistencyLevel.QUORUM)
 
+    @ported_to_in_jvm('4.0')
     def test_readrepair(self):
         cluster = self.cluster
         cluster.set_configuration_options(values={'hinted_handoff_enabled': False})
